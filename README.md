@@ -13,6 +13,12 @@
 按候选 index 对齐的 q/具体度/淘汰原因，以及顶层 `selection_changed`，便于定位规则
 调整导致的结果变化。
 
+`POST /audit-cache-keys` 用于**按缓存键审计多条样本的协商一致性**：请求包含一组
+共用候选与有序 samples（每项含唯一 `id`、`cache_key`、`accept`），逐项复用现有协商
+规则（记录选中候选索引或 406），再按 `cache_key` 分组；同组出现不同候选索引、或
+200 与 406 并存时计入 `collisions`，便于发现"同一缓存键在不同 Accept 下命中不同表示"
+这类问题。
+
 ## 一条命令启动
 
 ```bash
@@ -285,6 +291,103 @@ curl -i -X POST http://localhost:8000/compare-accept \
 `null`（`candidates` 明细保留，淘汰原因为 `q_zero`），`trial` 正常选定，
 `selection_changed` 为 `true`。
 
+### `POST /audit-cache-keys`
+
+在**一组共用候选表示**上对多条样本逐条协商，并按 `cache_key` 审计一致性。典型场景：
+同一缓存键下的内容会被不同客户端的 `Accept` 命中，需要检查它们最终选中的表示是否一致。
+
+请求体：
+
+```json
+{
+  "candidates": [
+    {"media_type": "application/json", "server_priority": 1},
+    {"media_type": "text/html", "server_priority": 1}
+  ],
+  "samples": [
+    {"id": "s1", "cache_key": "article:42", "accept": "application/json"},
+    {"id": "s2", "cache_key": "article:42", "accept": "text/html"},
+    {"id": "s3", "cache_key": "article:42", "accept": "application/json;q=0.9"},
+    {"id": "s4", "cache_key": "home", "accept": "image/png"},
+    {"id": "s5", "cache_key": "home", "accept": "image/gif"}
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `candidates` | 所有样本**共用**的候选表示列表（有序），语法同 `/negotiate`，不能为空 |
+| `samples[].id` | 样本唯一 id，**重复返回 400** |
+| `samples[].cache_key` | 缓存键；相同键的样本归入同一组，允许重复 |
+| `samples[].accept` | 该样本的原始 `Accept` 头字符串，任一非法整体返回 **400** |
+
+审计规则：
+
+1. 按 `samples` 输入顺序逐项复用 `/negotiate` 的协商规则；每项记录 `status`
+   （200/406）与 `selected_index`（406 时为 `null`）；
+2. 按 `cache_key` 分组，组与组内的样本均保持**首次出现顺序**；每组把结果归入分区
+   （partition）——200 按选中候选索引分区，全部 406 归入同一个 `(406, null)` 分区；
+3. 同组出现**多个分区**即为碰撞（collision）：选中了不同候选索引，或 200 与 406 并存；
+   仅有多个 406、或全部选中同一候选索引的组不算碰撞；
+4. 响应返回逐项 `results`、全部 `groups`（含各分区及关联 sample id）、碰撞子集
+   `collisions`（与 groups 中同构）以及 `safe_group_count`（无碰撞组数量）；
+5. 任一 `Accept` 或候选非法、`samples` 为空、id 重复、请求体格式错误时，整体返回与
+   `/negotiate` 相同的 **400** 格式，不返回任何部分结果。
+
+#### 200 响应示例（对应上面的请求）
+
+```json
+{
+  "results": [
+    {"id": "s1", "cache_key": "article:42", "status": 200, "selected_index": 0},
+    {"id": "s2", "cache_key": "article:42", "status": 200, "selected_index": 1},
+    {"id": "s3", "cache_key": "article:42", "status": 200, "selected_index": 0},
+    {"id": "s4", "cache_key": "home", "status": 406, "selected_index": null},
+    {"id": "s5", "cache_key": "home", "status": 406, "selected_index": null}
+  ],
+  "groups": [
+    {
+      "cache_key": "article:42",
+      "sample_ids": ["s1", "s2", "s3"],
+      "partitions": [
+        {"status": 200, "selected_index": 0, "sample_ids": ["s1", "s3"]},
+        {"status": 200, "selected_index": 1, "sample_ids": ["s2"]}
+      ],
+      "collision": true
+    },
+    {
+      "cache_key": "home",
+      "sample_ids": ["s4", "s5"],
+      "partitions": [
+        {"status": 406, "selected_index": null, "sample_ids": ["s4", "s5"]}
+      ],
+      "collision": false
+    }
+  ],
+  "collisions": [
+    {
+      "cache_key": "article:42",
+      "sample_ids": ["s1", "s2", "s3"],
+      "partitions": [
+        {"status": 200, "selected_index": 0, "sample_ids": ["s1", "s3"]},
+        {"status": 200, "selected_index": 1, "sample_ids": ["s2"]}
+      ],
+      "collision": true
+    }
+  ],
+  "safe_group_count": 1
+}
+```
+
+`article:42` 组内 s1/s3 选中候选 0、s2 选中候选 1，构成碰撞；`home` 组虽然两个样本
+都协商失败（各自的 Accept 不命中任何候选），但同属一个 406 分区，不计碰撞。
+
+```bash
+curl -i -X POST http://localhost:8000/audit-cache-keys \
+  -H 'Content-Type: application/json' \
+  -d '{"candidates":[{"media_type":"application/json","server_priority":1},{"media_type":"text/html","server_priority":1}],"samples":[{"id":"s1","cache_key":"article:42","accept":"application/json"},{"id":"s2","cache_key":"article:42","accept":"text/html"}]}'
+```
+
 ## 本地开发（不使用容器）
 
 ```bash
@@ -303,7 +406,7 @@ pytest -q
 
 ```
 app/
-  main.py          # FastAPI 路由（/negotiate、/audit-accept、/compare-accept）、请求/响应模型、错误处理与启动初始化
+  main.py          # FastAPI 路由（/negotiate、/audit-accept、/compare-accept、/audit-cache-keys）、请求/响应模型、错误处理与启动初始化
   negotiation.py   # Accept 解析、内容协商与静态审计核心逻辑（无框架依赖，可独立测试）
 tests/             # 协商规则、审计规则与 HTTP 接口测试
 Dockerfile         # 依赖安装与初始化纳入镜像构建阶段

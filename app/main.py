@@ -28,7 +28,8 @@ logger = logging.getLogger("content-negotiation")
 async def lifespan(app: FastAPI):
     # 容器启动初始化：仅记录就绪日志；依赖安装已在镜像构建阶段完成。
     logger.info(
-        "内容协商调试服务已就绪：POST /negotiate, POST /audit-accept, POST /compare-accept"
+        "内容协商调试服务已就绪：POST /negotiate, POST /audit-accept, "
+        "POST /compare-accept, POST /audit-cache-keys"
     )
     yield
     logger.info("内容协商调试服务关闭")
@@ -145,6 +146,47 @@ class CompareAcceptResponse(BaseModel):
     selection_changed: bool
 
 
+class AuditCacheKeySampleIn(BaseModel):
+    id: str = Field(..., description="样本唯一 id")
+    cache_key: str = Field(..., description="缓存键，相同键的样本归入同一组")
+    accept: str = Field(..., description="该样本的原始 Accept 头字符串")
+
+
+class AuditCacheKeysRequest(BaseModel):
+    candidates: list[CandidateIn] = Field(..., description="所有样本共用的候选表示列表（有序）")
+    samples: list[AuditCacheKeySampleIn] = Field(
+        ..., description="待审计样本（有序）；逐项套用共用候选协商"
+    )
+
+
+class CacheKeySampleResultOut(BaseModel):
+    id: str
+    cache_key: str
+    status: int
+    selected_index: int | None
+
+
+class CacheKeyPartitionOut(BaseModel):
+    # 组内一个结果分区：200 时 selected_index 为候选索引；406 时为 null。
+    status: int
+    selected_index: int | None
+    sample_ids: list[str]
+
+
+class CacheKeyGroupOut(BaseModel):
+    cache_key: str
+    sample_ids: list[str]
+    partitions: list[CacheKeyPartitionOut]
+    collision: bool
+
+
+class AuditCacheKeysResponse(BaseModel):
+    results: list[CacheKeySampleResultOut]
+    groups: list[CacheKeyGroupOut]
+    collisions: list[CacheKeyGroupOut]
+    safe_group_count: int
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str
@@ -175,6 +217,7 @@ async def root() -> dict:
             "POST /negotiate",
             "POST /audit-accept",
             "POST /compare-accept",
+            "POST /audit-cache-keys",
         ],
     }
 
@@ -415,4 +458,100 @@ async def do_compare_accept(payload: CompareAcceptRequest):
             baseline, trial, len(raw_candidates)
         ),
         "selection_changed": baseline_selected != trial_selected,
+    }
+
+
+@app.post(
+    "/audit-cache-keys",
+    response_model=AuditCacheKeysResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "任一 Accept 或候选非法、id 重复或 samples 为空"},
+    },
+)
+async def do_audit_cache_keys(payload: AuditCacheKeysRequest):
+    # 共用候选沿用 /negotiate 的业务校验；任一非法整体 400。
+    invalid = _validate_candidates(payload.candidates)
+    if invalid is not None:
+        return invalid
+
+    # samples 必须非空；id 必须唯一（cache_key 允许重复，重复即分组依据）。
+    if not payload.samples:
+        return _bad_request("samples 不能为空")
+    seen_ids: set[str] = set()
+    for sample in payload.samples:
+        if sample.id in seen_ids:
+            return _bad_request(f"samples 中存在重复 id: {sample.id}")
+        seen_ids.add(sample.id)
+
+    raw_candidates = [(c.media_type, c.server_priority) for c in payload.candidates]
+
+    # 逐项复用现有协商规则；任一 Accept 非法时整体 400，不返回部分结果。
+    results: list[dict] = []
+    # 按 cache_key 首次出现顺序保存分组，组内按样本出现顺序累积各分区。
+    groups: dict[str, dict] = {}
+    for sample in payload.samples:
+        try:
+            side = _negotiate_side(sample.accept, raw_candidates)
+        except AcceptSyntaxError as exc:
+            return _bad_request(str(exc))
+
+        selected_index = (
+            side["selected"]["index"] if side["selected"] is not None else None
+        )
+        results.append(
+            {
+                "id": sample.id,
+                "cache_key": sample.cache_key,
+                "status": side["status"],
+                "selected_index": selected_index,
+            }
+        )
+
+        # 分区键：200 按选中候选索引区分；406 统一为 (406, None)。
+        partition_key = (side["status"], selected_index)
+        group = groups.setdefault(
+            sample.cache_key,
+            {"cache_key": sample.cache_key, "sample_ids": [], "partitions": []},
+        )
+        group["sample_ids"].append(sample.id)
+        partition = next(
+            (p for p in group["partitions"] if p["key"] == partition_key), None
+        )
+        if partition is None:
+            partition = {
+                "key": partition_key,
+                "status": side["status"],
+                "selected_index": selected_index,
+                "sample_ids": [],
+            }
+            group["partitions"].append(partition)
+        partition["sample_ids"].append(sample.id)
+
+    group_payloads: list[dict] = []
+    collisions: list[dict] = []
+    for group in groups.values():
+        # 出现多个不同分区键即碰撞：不同候选索引，或 200 与 406 并存。
+        collision = len(group["partitions"]) > 1
+        group_payload = {
+            "cache_key": group["cache_key"],
+            "sample_ids": group["sample_ids"],
+            "partitions": [
+                {
+                    "status": p["status"],
+                    "selected_index": p["selected_index"],
+                    "sample_ids": p["sample_ids"],
+                }
+                for p in group["partitions"]
+            ],
+            "collision": collision,
+        }
+        group_payloads.append(group_payload)
+        if collision:
+            collisions.append(group_payload)
+
+    return {
+        "results": results,
+        "groups": group_payloads,
+        "collisions": collisions,
+        "safe_group_count": len(group_payloads) - len(collisions),
     }

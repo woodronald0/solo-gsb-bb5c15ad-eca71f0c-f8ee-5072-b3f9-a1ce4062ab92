@@ -38,6 +38,13 @@ def post_compare(baseline, trial, candidates):
     )
 
 
+def post_audit_cache_keys(candidates, samples):
+    return client.post(
+        "/audit-cache-keys",
+        json={"candidates": candidates, "samples": samples},
+    )
+
+
 # ---------- parse_accept ----------
 
 
@@ -606,4 +613,156 @@ def test_compare_endpoint_400_malformed_body():
     )
     assert resp.status_code == 400
     # 缺字段时由 Pydantic 校验统一 400。
+    assert resp.json()["error"] == "bad_request"
+
+
+# ---------- /audit-cache-keys HTTP 接口 ----------
+
+
+CACHE_CANDIDATES = [
+    {"media_type": "application/json", "server_priority": 1},
+    {"media_type": "text/html", "server_priority": 1},
+]
+
+
+def test_audit_cache_keys_safe_same_index_and_all_406():
+    resp = post_audit_cache_keys(
+        CACHE_CANDIDATES,
+        [
+            {"id": "s1", "cache_key": "alpha", "accept": "application/json"},
+            {"id": "s2", "cache_key": "alpha",
+             "accept": "application/json, text/html;q=0.5"},
+            {"id": "s3", "cache_key": "beta", "accept": "image/png"},
+            {"id": "s4", "cache_key": "beta", "accept": "image/gif"},
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # 逐项结果与样本顺序一致。
+    assert [(r["id"], r["status"], r["selected_index"]) for r in body["results"]] == [
+        ("s1", 200, 0),
+        ("s2", 200, 0),
+        ("s3", 406, None),
+        ("s4", 406, None),
+    ]
+
+    # 分组按首次出现顺序：alpha -> beta。
+    assert [g["cache_key"] for g in body["groups"]] == ["alpha", "beta"]
+    alpha, beta = body["groups"]
+    assert alpha["sample_ids"] == ["s1", "s2"]
+    assert alpha["collision"] is False
+    assert len(alpha["partitions"]) == 1
+    assert alpha["partitions"][0] == {
+        "status": 200,
+        "selected_index": 0,
+        "sample_ids": ["s1", "s2"],
+    }
+    # 全部 406 不构成碰撞。
+    assert beta["sample_ids"] == ["s3", "s4"]
+    assert beta["collision"] is False
+    assert beta["partitions"] == [
+        {"status": 406, "selected_index": None, "sample_ids": ["s3", "s4"]}
+    ]
+
+    assert body["collisions"] == []
+    assert body["safe_group_count"] == 2
+
+
+def test_audit_cache_keys_collision_different_indices():
+    resp = post_audit_cache_keys(
+        CACHE_CANDIDATES,
+        [
+            {"id": "s1", "cache_key": "alpha", "accept": "application/json"},
+            {"id": "s2", "cache_key": "alpha", "accept": "text/html"},
+            # 第三样本与 s1 同分区，验证分区聚合并保持样本顺序。
+            {"id": "s3", "cache_key": "alpha", "accept": "application/json;q=0.9"},
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["safe_group_count"] == 0
+    assert len(body["collisions"]) == 1
+    collision = body["collisions"][0]
+    assert collision["cache_key"] == "alpha"
+    assert collision["sample_ids"] == ["s1", "s2", "s3"]
+    # 分区按各自首次出现顺序排列。
+    assert collision["partitions"] == [
+        {"status": 200, "selected_index": 0, "sample_ids": ["s1", "s3"]},
+        {"status": 200, "selected_index": 1, "sample_ids": ["s2"]},
+    ]
+
+
+def test_audit_cache_keys_collision_200_and_406_mixed():
+    resp = post_audit_cache_keys(
+        CACHE_CANDIDATES,
+        [
+            {"id": "s1", "cache_key": "k", "accept": "image/png"},
+            {"id": "s2", "cache_key": "safe", "accept": "*/*"},
+            {"id": "s3", "cache_key": "k", "accept": "application/json"},
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # 分组按首次出现：k（碰撞）、safe（无碰撞）。
+    assert [g["cache_key"] for g in body["groups"]] == ["k", "safe"]
+    assert [c["cache_key"] for c in body["collisions"]] == ["k"]
+    colliding = body["collisions"][0]
+    assert colliding["partitions"] == [
+        {"status": 406, "selected_index": None, "sample_ids": ["s1"]},
+        {"status": 200, "selected_index": 0, "sample_ids": ["s3"]},
+    ]
+    assert body["safe_group_count"] == 1
+
+
+def test_audit_cache_keys_400_duplicate_id():
+    resp = post_audit_cache_keys(
+        CACHE_CANDIDATES,
+        [
+            {"id": "dup", "cache_key": "a", "accept": "*/*"},
+            {"id": "dup", "cache_key": "b", "accept": "*/*"},
+        ],
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "bad_request"
+
+
+def test_audit_cache_keys_400_empty_samples():
+    resp = post_audit_cache_keys(CACHE_CANDIDATES, [])
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "bad_request"
+
+
+def test_audit_cache_keys_400_bad_accept():
+    resp = post_audit_cache_keys(
+        CACHE_CANDIDATES,
+        [
+            {"id": "s1", "cache_key": "a", "accept": "*/*"},
+            {"id": "s2", "cache_key": "a", "accept": "application/json;q=2"},
+        ],
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "bad_request"
+
+
+def test_audit_cache_keys_400_bad_candidate():
+    resp = post_audit_cache_keys(
+        [{"media_type": "text/*"}],
+        [{"id": "s1", "cache_key": "a", "accept": "*/*"}],
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "bad_request"
+
+
+def test_audit_cache_keys_400_empty_candidates_and_malformed_body():
+    resp = post_audit_cache_keys(
+        [], [{"id": "s1", "cache_key": "a", "accept": "*/*"}]
+    )
+    assert resp.status_code == 400
+
+    resp = client.post(
+        "/audit-cache-keys",
+        json={"samples": [{"id": "s1", "cache_key": "a", "accept": "*/*"}]},
+    )
+    assert resp.status_code == 400
     assert resp.json()["error"] == "bad_request"
