@@ -13,6 +13,10 @@
 按候选 index 对齐的 q/具体度/淘汰原因，以及顶层 `selection_changed`，便于定位规则
 调整导致的结果变化。
 
+`POST /audit-cache-keys` 用于**按缓存键批量审计多条请求的协商结果**：多个 sample
+共用同一组候选、各自携带一条 `Accept`，服务逐项复用现有协商规则，记录选中候选或
+406，并按 `cache_key` 分组检测碰撞（同组选中不同候选，或 200 与 406 并存）。
+
 ## 一条命令启动
 
 ```bash
@@ -285,6 +289,113 @@ curl -i -X POST http://localhost:8000/compare-accept \
 `null`（`candidates` 明细保留，淘汰原因为 `q_zero`），`trial` 正常选定，
 `selection_changed` 为 `true`。
 
+### `POST /audit-cache-keys`
+
+给定**一组共用候选**和**一批有序 sample**（每个 sample 含唯一 `id`、`cache_key`
+与自己的 `accept`），逐项套用与 `/negotiate` 完全相同的协商规则，记录每个 sample
+选中的候选或 406，再按 `cache_key` 分组并检测组内碰撞。典型用途：排查"同一缓存键
+为什么在不同 Accept 下产生了不同响应"。
+
+请求体：
+
+```json
+{
+  "candidates": [
+    {"media_type": "application/json", "server_priority": 1},
+    {"media_type": "text/html", "server_priority": 5}
+  ],
+  "samples": [
+    {"id": "req-1", "cache_key": "user:42:home", "accept": "application/json"},
+    {"id": "req-2", "cache_key": "user:42:home", "accept": "text/html"},
+    {"id": "req-3", "cache_key": "user:42:home", "accept": "image/png"},
+    {"id": "req-4", "cache_key": "user:7:home",  "accept": "application/json"}
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `candidates` | 所有 sample **共用**的候选表示列表（有序），语法同 `/negotiate` |
+| `samples[].id` | sample 唯一标识，请求内**不得重复** |
+| `samples[].cache_key` | 缓存分组键，相同键的 sample 归入同一结果分区 |
+| `samples[].accept` | 该 sample 的原始 `Accept` 头字符串 |
+
+分组与碰撞规则：
+
+1. 每个 sample 独立协商，结果含 `status`（200/406）、`error`/`detail`、`selected`
+   （200 时与 `/negotiate` 的 `selected` 同构，406 时为 `null`）；
+2. 按 `cache_key` 划分结果分区（`groups`），组内 `results` 与 `sample_ids` 均按
+   请求顺序排列；组之间、`collisions` 摘要均按 **cache_key 首次出现顺序**稳定排列；
+3. 同组出现**不同选中候选索引**，列入碰撞，原因为 `divergent_selection`；
+4. 同组 **200 与 406 并存**，列入碰撞，原因为 `mixed_status`（与索引分叉同时存在时
+   优先报告 `mixed_status`）；
+5. 组内全部选中同一候选（即便 q 值不同）或全部 406，均**不算碰撞**；无碰撞组计入
+   `safe_group_count`。
+
+#### 200 响应示例（对应上面的请求）
+
+```json
+{
+  "groups": [
+    {
+      "cache_key": "user:42:home",
+      "sample_ids": ["req-1", "req-2", "req-3"],
+      "results": [
+        {"id": "req-1", "status": 200, "error": null, "detail": null,
+         "selected": {"index": 0, "media_type": "application/json",
+                      "server_priority": 1.0, "matched_range": "application/json",
+                      "q": 1.0, "specificity": 2, "specificity_name": "exact"}},
+        {"id": "req-2", "status": 200, "error": null, "detail": null,
+         "selected": {"index": 1, "media_type": "text/html",
+                      "server_priority": 5.0, "matched_range": "text/html",
+                      "q": 1.0, "specificity": 2, "specificity_name": "exact"}},
+        {"id": "req-3", "status": 406, "error": "not_acceptable",
+         "detail": "没有可接受的候选表示", "selected": null}
+      ],
+      "collision": true
+    },
+    {
+      "cache_key": "user:7:home",
+      "sample_ids": ["req-4"],
+      "results": [
+        {"id": "req-4", "status": 200, "error": null, "detail": null,
+         "selected": {"index": 0, "media_type": "application/json",
+                      "server_priority": 1.0, "matched_range": "application/json",
+                      "q": 1.0, "specificity": 2, "specificity_name": "exact"}}
+      ],
+      "collision": false
+    }
+  ],
+  "collisions": [
+    {
+      "cache_key": "user:42:home",
+      "reason": "mixed_status",
+      "sample_ids": ["req-1", "req-2", "req-3"],
+      "selected_indices": [0, 1, null],
+      "statuses": [200, 200, 406]
+    }
+  ],
+  "safe_group_count": 1,
+  "group_count": 2
+}
+```
+
+```bash
+curl -i -X POST http://localhost:8000/audit-cache-keys \
+  -H 'Content-Type: application/json' \
+  -d '{"candidates":[{"media_type":"application/json","server_priority":1},{"media_type":"text/html","server_priority":5}],"samples":[{"id":"req-1","cache_key":"k","accept":"application/json"},{"id":"req-2","cache_key":"k","accept":"text/html"}]}'
+```
+
+#### 错误响应
+
+整体请求要么成功（单个 sample 的 406 是正常结果，不是错误），要么返回 **400** 且
+不返回任何分组结果，错误体与其它接口一致（`{"error":"bad_request","detail":...}`）：
+
+- 任一 sample 的 `Accept` 语法非法；
+- 候选媒体类型不具体、候选列表为空、`server_priority` 非有限数；
+- `samples` 为空，或存在重复 `id`；
+- 请求体结构/类型错误。
+
 ## 本地开发（不使用容器）
 
 ```bash
@@ -303,7 +414,7 @@ pytest -q
 
 ```
 app/
-  main.py          # FastAPI 路由（/negotiate、/audit-accept、/compare-accept）、请求/响应模型、错误处理与启动初始化
+  main.py          # FastAPI 路由（/negotiate、/audit-accept、/compare-accept、/audit-cache-keys）、请求/响应模型、错误处理与启动初始化
   negotiation.py   # Accept 解析、内容协商与静态审计核心逻辑（无框架依赖，可独立测试）
 tests/             # 协商规则、审计规则与 HTTP 接口测试
 Dockerfile         # 依赖安装与初始化纳入镜像构建阶段

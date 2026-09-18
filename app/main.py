@@ -19,6 +19,7 @@ from .negotiation import (
     SPECIFICITY_NAMES,
     audit_accept,
     negotiate,
+    validate_concrete_media_type,
 )
 
 logger = logging.getLogger("content-negotiation")
@@ -28,7 +29,8 @@ logger = logging.getLogger("content-negotiation")
 async def lifespan(app: FastAPI):
     # 容器启动初始化：仅记录就绪日志；依赖安装已在镜像构建阶段完成。
     logger.info(
-        "内容协商调试服务已就绪：POST /negotiate, POST /audit-accept, POST /compare-accept"
+        "内容协商调试服务已就绪：POST /negotiate, POST /audit-accept, "
+        "POST /compare-accept, POST /audit-cache-keys"
     )
     yield
     logger.info("内容协商调试服务关闭")
@@ -145,6 +147,53 @@ class CompareAcceptResponse(BaseModel):
     selection_changed: bool
 
 
+class CacheKeySampleIn(BaseModel):
+    id: str = Field(..., description="sample 唯一标识（在请求内不得重复）")
+    cache_key: str = Field(..., description="缓存分组键，相同 cache_key 的 sample 归为一组")
+    accept: str = Field(..., description="该 sample 的原始 Accept 头字符串")
+
+
+class AuditCacheKeysRequest(BaseModel):
+    candidates: list[CandidateIn] = Field(
+        ..., description="所有 sample 共用的候选表示列表（有序）"
+    )
+    samples: list[CacheKeySampleIn] = Field(
+        ..., description="待审计的 sample 列表（有序，决定首次出现顺序）"
+    )
+
+
+class CacheKeySampleOut(BaseModel):
+    id: str
+    status: int
+    error: str | None
+    detail: str | None
+    selected: SelectedOut | None
+
+
+class CacheKeyGroupOut(BaseModel):
+    # 按 cache_key 划分的结果分区：组内 sample 按请求顺序排列。
+    cache_key: str
+    sample_ids: list[str]
+    results: list[CacheKeySampleOut]
+    collision: bool
+
+
+class CacheKeyCollisionOut(BaseModel):
+    # 碰撞摘要：只记录定位所需字段，稳定按组首次出现顺序排列。
+    cache_key: str
+    reason: str  # divergent_selection | mixed_status
+    sample_ids: list[str]
+    selected_indices: list[int | None]
+    statuses: list[int]
+
+
+class AuditCacheKeysResponse(BaseModel):
+    groups: list[CacheKeyGroupOut]
+    collisions: list[CacheKeyCollisionOut]
+    safe_group_count: int
+    group_count: int
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str
@@ -175,6 +224,7 @@ async def root() -> dict:
             "POST /negotiate",
             "POST /audit-accept",
             "POST /compare-accept",
+            "POST /audit-cache-keys",
         ],
     }
 
@@ -415,4 +465,107 @@ async def do_compare_accept(payload: CompareAcceptRequest):
             baseline, trial, len(raw_candidates)
         ),
         "selection_changed": baseline_selected != trial_selected,
+    }
+
+
+@app.post(
+    "/audit-cache-keys",
+    response_model=AuditCacheKeysResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "任一 Accept 或候选非法、id 重复或 samples 为空"},
+    },
+)
+async def do_audit_cache_keys(payload: AuditCacheKeysRequest):
+    # 多个 sample 共用同一组候选、各自带一条 Accept：逐项复用现有协商规则，
+    # 记录选中候选或 406，按 cache_key 分组并检测组内碰撞。
+    invalid = _validate_candidates(payload.candidates)
+    if invalid is not None:
+        return invalid
+
+    if not payload.samples:
+        return _bad_request("samples 不能为空")
+
+    seen_ids: set[str] = set()
+    for sample in payload.samples:
+        if sample.id in seen_ids:
+            return _bad_request(f"samples 存在重复 id: {sample.id!r}")
+        seen_ids.add(sample.id)
+
+    # 候选媒体类型预先校验，使非法候选的 400 归属于 candidates 而非某个 sample。
+    raw_candidates: list[tuple[str, float]] = []
+    for i, cand in enumerate(payload.candidates):
+        media_type = cand.media_type.strip().lower()
+        try:
+            validate_concrete_media_type(media_type)
+        except AcceptSyntaxError as exc:
+            return _bad_request(f"candidates[{i}] {exc}")
+        raw_candidates.append((media_type, cand.server_priority))
+
+    # 任一 Accept 非法：整体 400，不返回任何分组结果（与 /compare-accept 一致）。
+    try:
+        sides = [_negotiate_side(s.accept, raw_candidates) for s in payload.samples]
+    except AcceptSyntaxError as exc:
+        return _bad_request(str(exc))
+
+    # 按 cache_key 分组，组与组均按首次出现顺序稳定排列。
+    order: list[str] = []
+    grouped: dict[str, dict[str, Any]] = {}
+    for sample, side in zip(payload.samples, sides):
+        result = {
+            "id": sample.id,
+            "status": side["status"],
+            "error": side["error"],
+            "detail": side["detail"],
+            "selected": side["selected"],
+        }
+        group = grouped.get(sample.cache_key)
+        if group is None:
+            order.append(sample.cache_key)
+            group = {
+                "cache_key": sample.cache_key,
+                "sample_ids": [],
+                "results": [],
+            }
+            grouped[sample.cache_key] = group
+        group["sample_ids"].append(sample.id)
+        group["results"].append(result)
+
+    groups: list[dict[str, Any]] = []
+    collisions: list[dict[str, Any]] = []
+    for cache_key in order:
+        group = grouped[cache_key]
+        statuses = [r["status"] for r in group["results"]]
+        selected_indices = [
+            r["selected"]["index"] if r["selected"] is not None else None
+            for r in group["results"]
+        ]
+        has_200 = 200 in statuses
+        has_406 = 406 in statuses
+
+        # 200 与 406 并存优先判定；否则选中候选索引不唯一即为索引分叉。
+        if has_200 and has_406:
+            reason = "mixed_status"
+        elif len({idx for idx in selected_indices if idx is not None}) > 1:
+            reason = "divergent_selection"
+        else:
+            reason = None
+
+        group["collision"] = reason is not None
+        groups.append(group)
+        if reason is not None:
+            collisions.append(
+                {
+                    "cache_key": cache_key,
+                    "reason": reason,
+                    "sample_ids": list(group["sample_ids"]),
+                    "selected_indices": selected_indices,
+                    "statuses": statuses,
+                }
+            )
+
+    return {
+        "groups": groups,
+        "collisions": collisions,
+        "safe_group_count": sum(1 for g in groups if not g["collision"]),
+        "group_count": len(groups),
     }
